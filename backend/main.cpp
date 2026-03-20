@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include "Server/Server.h"
 #include "Analyzer/Analyzer.h"
@@ -24,9 +26,7 @@ int main() {
     std::cout << "=== ExtreamFS Backend ===" << std::endl;
     
     Server server;
-    DiskManagement diskManager;
     SessionManager sessionManager;
-    Analyzer analyzer;
     
     // Servir frontend estático (opcional)
     server.get("/", [](const Request& req, Response& res) {
@@ -61,9 +61,19 @@ int main() {
                         if (commandText[end] == '"') break;
                     }
                     commandText = commandText.substr(pos + 1, end - pos - 1);
-                    for (size_t i = 0; i < commandText.length(); i++)
-                        if (commandText[i] == '\\' && i + 1 < commandText.length() && commandText[i+1] == 'n')
+                    // JSON puede venir con escapes tipo \"\\n\" y \"\\r\".
+                    // Los convertimos a los caracteres reales para que luego el parser los ignore.
+                    for (size_t i = 0; i + 1 < commandText.length(); ) {
+                        if (commandText[i] == '\\' && commandText[i + 1] == 'n') {
                             commandText.replace(i, 2, "\n");
+                            continue;
+                        }
+                        if (commandText[i] == '\\' && commandText[i + 1] == 'r') {
+                            commandText.replace(i, 2, "\r");
+                            continue;
+                        }
+                        i++;
+                    }
                 }
             }
         } else if (commandText.find('{') == 0 && commandText.find('}') != std::string::npos) {
@@ -79,7 +89,8 @@ int main() {
         std::istringstream iss(commandText);
         std::string line;
         while (std::getline(iss, line)) {
-            while (!line.empty() && line.back() == '\r') line.pop_back();
+            // Ignorar cualquier '\r' residual dentro de la línea.
+            line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
             size_t first = line.find_first_not_of(" \t\r\n");
             if (first == std::string::npos) continue;
             line = line.substr(first);
@@ -92,52 +103,67 @@ int main() {
         if (lines.empty()) lines.push_back("");
         
         for (const std::string& singleLine : lines) {
-            auto cmd = analyzer.parseCommand(singleLine);
+            Analyzer::ParsedCommand cmd = Analyzer::parseLine(singleLine);
             std::string lineResult;
         
             if (cmd.name == "comment") {
                 lineResult = (singleLine.find('#') == 0) ? singleLine : "";
             }
             else if (cmd.name == "mkdisk") {
+            static const std::set<std::string> mkOk = {"size", "unit", "path", "fit", "p", "r"};
+            bool bad = false;
+            for (const auto& kv : cmd.params) {
+                if (!mkOk.count(kv.first)) {
+                    lineResult = "Error: parámetro no permitido en mkdisk (-" + kv.first + ").";
+                    bad = true;
+                    break;
+                }
+            }
+            if (!bad && (cmd.hasParam("p") || cmd.hasParam("r"))) {
+                lineResult = "Error: mkdisk no usa -p ni -r.";
+                bad = true;
+            }
             int size = 0;
             try { size = std::stoi(cmd.getParam("size", "0")); } catch(...) {}
             std::string unit = cmd.getParam("unit", "M");
-            std::string path = cmd.getParam("path");
+            std::string path = Utilities::sanitizeHostPath(cmd.getParam("path"));
             std::string fit = cmd.getParam("fit", "FF");
-            if (path.empty()) lineResult = "Error: -path obligatorio.";
-            else if (size <= 0) lineResult = "Error: -size debe ser positivo.";
-            else if (diskManager.mkdisk(size, unit, path, fit)) lineResult = "MKDISK ejecutado correctamente.";
-            else lineResult = "Error al crear el disco.";
+            if (!bad) {
+                if (path.empty()) lineResult = "Error: -path obligatorio.";
+                else if (size <= 0) lineResult = "Error: -size debe ser positivo.";
+                else if (DiskManagement::mkdisk(size, unit, path, fit)) lineResult = "MKDISK ejecutado correctamente.";
+                else lineResult = "Error al crear el disco.";
+            }
         }
         else if (cmd.name == "rmdisk") {
-            std::string path = cmd.getParam("path");
+            std::string path = Utilities::sanitizeHostPath(cmd.getParam("path"));
             if (path.empty()) lineResult = "Error: -path obligatorio.";
             else if (!Utilities::fileExists(path)) lineResult = "Error: El disco no existe.";
-            else if (diskManager.rmdisk(path)) lineResult = "RMDISK ejecutado correctamente.";
+            else if (DiskManagement::rmdisk(path)) lineResult = "RMDISK ejecutado correctamente.";
             else lineResult = "Error al eliminar el disco.";
         }
         else if (cmd.name == "fdisk") {
             int size = 0;
             try { size = std::stoi(cmd.getParam("size", "0")); } catch(...) {}
             std::string unit = cmd.getParam("unit", "K");
-            std::string path = cmd.getParam("path");
+            std::string path = Utilities::sanitizeHostPath(cmd.getParam("path"));
             std::string type = cmd.getParam("type", "P");
             std::string fit = cmd.getParam("fit", "WF");
             std::string name = cmd.getParam("name");
             if (path.empty() || name.empty()) lineResult = "Error: -path y -name obligatorios.";
             else if (size <= 0) lineResult = "Error: -size debe ser positivo.";
-            else if (diskManager.fdisk(size, unit, path, type, fit, name)) lineResult = "FDISK ejecutado correctamente.";
+            else if (DiskManagement::fdisk(size, unit, path, type, fit, name)) lineResult = "FDISK ejecutado correctamente.";
             else lineResult = "Error al crear la partición.";
         }
         else if (cmd.name == "mount") {
-            std::string path = cmd.getParam("path");
+            std::string path = Utilities::sanitizeHostPath(cmd.getParam("path"));
             std::string name = cmd.getParam("name");
             std::string id;
             if (!sessionManager.mountPartition(path, name, id)) {
                 lineResult = "Error: No se pudo montar (partición ya montada o no encontrada).";
             } else {
                 int start, size;
-                if (diskManager.updatePartitionMount(path, name, id, start, size)) {
+                if (DiskManagement::updatePartitionMount(path, name, id, start, size)) {
                     sessionManager.addMountedPartition(path, name, id, start, size);
                     lineResult = "MOUNT ejecutado - ID: " + id;
                 } else {
@@ -159,7 +185,7 @@ int main() {
             MountedPartition* mp = sessionManager.findMountedPartition(id);
             if (!mp) {
                 lineResult = "Error: La partición con ID " + id + " no está montada.";
-            } else if (diskManager.mkfs(id, type, mp->path, mp->start, mp->size)) {
+            } else if (DiskManagement::mkfs(id, type, mp->path, mp->start, mp->size)) {
                 lineResult = "MKFS ejecutado correctamente.";
             } else {
                 lineResult = "Error al formatear la partición.";
@@ -172,7 +198,7 @@ int main() {
             MountedPartition* mp = sessionManager.findMountedPartition(id);
             if (!mp) {
                 lineResult = "Error: La partición con ID " + id + " no está montada.";
-            } else if (!diskManager.validateUser(mp->path, mp->start, mp->size, user, pass)) {
+            } else if (!DiskManagement::validateUser(mp->path, mp->start, mp->size, user, pass)) {
                 lineResult = "Error: Usuario o contraseña incorrectos.";
             } else if (!sessionManager.setSession(user, id)) {
                 lineResult = "Error: Ya hay una sesión activa. Haga logout primero.";
@@ -199,27 +225,27 @@ int main() {
                 else if (cmd.name == "mkgrp") {
                     std::string name = cmd.getParam("name");
                     if (name.empty()) lineResult = "Error: Parámetro -name obligatorio.";
-                    else if (diskManager.mkgrp(mp->path, mp->start, mp->size, name)) lineResult = "MKGRP ejecutado correctamente.";
+                    else if (DiskManagement::mkgrp(mp->path, mp->start, mp->size, name)) lineResult = "MKGRP ejecutado correctamente.";
                     else lineResult = "Error al crear el grupo.";
                 } else if (cmd.name == "rmgrp") {
                     std::string name = cmd.getParam("name");
                     if (name.empty()) lineResult = "Error: Parámetro -name obligatorio.";
-                    else if (diskManager.rmgrp(mp->path, mp->start, mp->size, name)) lineResult = "RMGRP ejecutado correctamente.";
+                    else if (DiskManagement::rmgrp(mp->path, mp->start, mp->size, name)) lineResult = "RMGRP ejecutado correctamente.";
                     else lineResult = "Error al eliminar el grupo.";
                 } else if (cmd.name == "mkusr") {
                     std::string user = cmd.getParam("user"), pass = cmd.getParam("pass"), grp = cmd.getParam("grp");
                     if (user.empty() || pass.empty() || grp.empty()) lineResult = "Error: -user, -pass y -grp obligatorios.";
-                    else if (diskManager.mkusr(mp->path, mp->start, mp->size, user, pass, grp)) lineResult = "MKUSR ejecutado correctamente.";
+                    else if (DiskManagement::mkusr(mp->path, mp->start, mp->size, user, pass, grp)) lineResult = "MKUSR ejecutado correctamente.";
                     else lineResult = "Error al crear el usuario.";
                 } else if (cmd.name == "rmusr") {
                     std::string user = cmd.getParam("user");
                     if (user.empty()) lineResult = "Error: Parámetro -user obligatorio.";
-                    else if (diskManager.rmusr(mp->path, mp->start, mp->size, user)) lineResult = "RMUSR ejecutado correctamente.";
+                    else if (DiskManagement::rmusr(mp->path, mp->start, mp->size, user)) lineResult = "RMUSR ejecutado correctamente.";
                     else lineResult = "Error al eliminar el usuario.";
                 } else if (cmd.name == "chgrp") {
                     std::string user = cmd.getParam("user"), grp = cmd.getParam("grp");
                     if (user.empty() || grp.empty()) lineResult = "Error: -user y -grp obligatorios.";
-                    else if (diskManager.chgrp(mp->path, mp->start, mp->size, user, grp)) lineResult = "CHGRP ejecutado correctamente.";
+                    else if (DiskManagement::chgrp(mp->path, mp->start, mp->size, user, grp)) lineResult = "CHGRP ejecutado correctamente.";
                     else lineResult = "Error al cambiar el grupo.";
                 }
             }
@@ -239,20 +265,52 @@ int main() {
                     if (!mp) lineResult = "Error: Partición no encontrada.";
                     else {
                         std::string catOut;
-                        diskManager.cat(mp->path, mp->start, mp->size, files, catOut);
+                        DiskManagement::cat(mp->path, mp->start, mp->size, files, catOut);
                         lineResult = catOut.empty() ? "(vacío)" : catOut;
                     }
                 }
             }
         }
+        else if (cmd.name == "mkdir") {
+            if (!sessionManager.isAuthenticated()) {
+                lineResult = "Error: Debe iniciar sesión.";
+            } else {
+                std::string vpath = cmd.getParam("path");
+                bool rec = cmd.hasFlag('p');
+                MountedPartition* mp = sessionManager.findMountedPartition(sessionManager.getCurrentPartitionId());
+                if (!mp) lineResult = "Error: Partición no encontrada.";
+                else if (vpath.empty()) lineResult = "Error: -path obligatorio.";
+                else if (DiskManagement::mkdir(mp->path, mp->start, mp->size, vpath, rec))
+                    lineResult = "MKDIR ejecutado correctamente.";
+                else lineResult = "Error al crear carpeta(s).";
+            }
+        }
+        else if (cmd.name == "mkfile") {
+            if (!sessionManager.isAuthenticated()) {
+                lineResult = "Error: Debe iniciar sesión.";
+            } else {
+                std::string vpath = cmd.getParam("path");
+                int fsz = 0;
+                try { fsz = std::stoi(cmd.getParam("size", "0")); } catch(...) {}
+                std::string cont = cmd.getParam("cont");
+                bool rec = cmd.hasFlag('r');
+                MountedPartition* mp = sessionManager.findMountedPartition(sessionManager.getCurrentPartitionId());
+                if (!mp) lineResult = "Error: Partición no encontrada.";
+                else if (vpath.empty()) lineResult = "Error: -path obligatorio.";
+                else if (fsz < 0) lineResult = "Error: -size no puede ser negativo.";
+                else if (DiskManagement::mkfile(mp->path, mp->start, mp->size, vpath, rec, fsz, cont))
+                    lineResult = "MKFILE ejecutado correctamente.";
+                else lineResult = "Error al crear el archivo.";
+            }
+        }
         else if (cmd.name == "rep") {
             std::string name = cmd.getParam("name");
-            std::string path = cmd.getParam("path");
+            std::string path = Utilities::sanitizeHostPath(cmd.getParam("path"));
             std::string id = cmd.getParam("id");
-            std::string path_file_ls = cmd.getParam("path_file_ls", "");
+            std::string path_file_ls = Utilities::sanitizeHostPath(cmd.getParam("path_file_ls", ""));
             MountedPartition* mp = sessionManager.findMountedPartition(id);
             if (!mp) lineResult = "Error: La partición con ID " + id + " no está montada.";
-            else if (diskManager.rep(name, path, mp->path, mp->start, mp->size, path_file_ls)) lineResult = "REP ejecutado: " + path;
+            else if (DiskManagement::rep(name, path, mp->path, mp->start, mp->size, path_file_ls)) lineResult = "REP ejecutado: " + path;
             else lineResult = "Error al generar el reporte.";
         }
         else {

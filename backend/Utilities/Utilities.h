@@ -15,7 +15,32 @@ public:
     
     //========== ARCHIVOS ==========
     static bool fileExists(const std::string& path);
+    /// Quita comillas sueltas y espacios (evita rutas tipo /home/"su_usuario"/... del PDF).
+    static std::string sanitizeHostPath(std::string path);
     static bool createDirectories(const std::string& path);
+    /// Estilo CLASE7 (Lab): crea directorios padre y archivo binario truncado.
+    static bool createFileWithParents(const std::string& path);
+    /// Mismo nombre que en el lab (CLASE7).
+    static bool CreateFile(const std::string& name);
+    /// Mismo nombre que en el lab (CLASE7): lectura/escritura binaria.
+    static std::fstream OpenFile(const std::string& name);
+    /// Estilo CLASE7: apertura binaria lectura/escritura (ruta saneada).
+    static std::fstream openBinaryReadWrite(const std::string& path);
+
+    template <typename T>
+    static bool WriteObject(std::fstream& file, const T& data, std::streampos pos) {
+        file.clear();
+        file.seekp(pos);
+        file.write(reinterpret_cast<const char*>(&data), sizeof(T));
+        return file.good();
+    }
+    template <typename T>
+    static bool ReadObject(std::fstream& file, T& data, std::streampos pos) {
+        file.clear();
+        file.seekg(pos);
+        file.read(reinterpret_cast<char*>(&data), sizeof(T));
+        return file.good();
+    }
     static std::string getFileName(const std::string& path);
     static std::string getParentPath(const std::string& path);
     

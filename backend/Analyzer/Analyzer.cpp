@@ -1,17 +1,30 @@
 #include "Analyzer.h"
+
 #include <algorithm>
 #include <cctype>
-#include <iostream>
+#include <regex>
+#include <sstream>
 
-Analyzer::Analyzer() {}
+namespace Analyzer {
 
-std::string Analyzer::toLowerCase(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(), ::tolower);
-    return result;
+static void replaceAll(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.length(), to);
+        pos += to.length();
+    }
 }
 
-std::string Analyzer::trim(const std::string& str) {
+static std::string normalizePdfQuotes(std::string s) {
+    replaceAll(s, u8"“", "\"");
+    replaceAll(s, u8"”", "\"");
+    replaceAll(s, u8"‘", "'");
+    replaceAll(s, u8"’", "'");
+    return s;
+}
+
+static std::string trim(std::string str) {
     size_t first = str.find_first_not_of(" \t\n\r");
     if (first == std::string::npos) return "";
     size_t last = str.find_last_not_of(" \t\n\r");
@@ -20,84 +33,63 @@ std::string Analyzer::trim(const std::string& str) {
     return result;
 }
 
-std::vector<std::string> Analyzer::split(const std::string& str, char delimiter) {
-    std::vector<std::string> tokens;
-    std::stringstream ss(str);
-    std::string token;
-    while (std::getline(ss, token, delimiter)) {
-        tokens.push_back(trim(token));
-    }
-    return tokens;
+static void stripCarriageReturns(std::string& s) {
+    for (size_t i = 0; i < s.length();)
+        if (s[i] == '\r') s.erase(i, 1);
+        else ++i;
 }
 
-Analyzer::Command Analyzer::parseCommand(const std::string& input) {
-    Command cmd;
-    std::string line = trim(input);
-    
+std::string ParsedCommand::getParam(const std::string& key, const std::string& defaultValue) const {
+    auto it = params.find(key);
+    return (it != params.end()) ? it->second : defaultValue;
+}
+
+ParsedCommand parseLine(const std::string& input) {
+    ParsedCommand cmd;
+    std::string line = trim(normalizePdfQuotes(input));
+    stripCarriageReturns(line);
+    line = trim(line);
+
     if (line.empty() || line[0] == '#') {
         cmd.name = "comment";
         return cmd;
     }
-    
-    // Separar por espacios respetando comillas
-    std::vector<std::string> parts;
-    std::string current;
-    bool inQuotes = false;
-    
-    for (char c : line) {
-        if (c == '"') {
-            inQuotes = !inQuotes;
-        } else if (c == ' ' && !inQuotes) {
-            if (!current.empty()) {
-                parts.push_back(current);
-                current.clear();
-            }
-        } else {
-            current += c;
-        }
+
+    std::istringstream iss(line);
+    std::string command;
+    if (!(iss >> command)) {
+        cmd.name = "comment";
+        return cmd;
     }
-    if (!current.empty()) {
-        parts.push_back(current);
+    std::transform(command.begin(), command.end(), command.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    // Misma idea que CLASE7: -param="valor" o -param=valor
+    static const std::regex re(R"(-(\w+)=("[^"]+"|\S+))");
+    std::sregex_iterator it(line.begin(), line.end(), re);
+    std::sregex_iterator end;
+
+    for (; it != end; ++it) {
+        std::string key = it->str(1);
+        std::string value = it->str(2);
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+            value = value.substr(1, value.size() - 2);
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        cmd.params[key] = value;
     }
-    
-    if (parts.empty()) return cmd;
-    
-    // El primer elemento es el nombre del comando
-    cmd.name = toLowerCase(parts[0]);
-    
-    // Procesar parámetros
-    for (size_t i = 1; i < parts.size(); i++) {
-        std::string param = parts[i];
-        size_t eqPos = param.find('=');
-        
-        if (eqPos != std::string::npos) {
-            std::string key = toLowerCase(param.substr(0, eqPos));
-            std::string value = param.substr(eqPos + 1);
-            while (!value.empty() && (value.front() == '"' || value.front() == '\'')) value.erase(0, 1);
-            while (!value.empty() && (value.back() == '"' || value.back() == '\'')) value.pop_back();
-            if (!key.empty() && key[0] == '-') key = key.substr(1);
-            cmd.params[key] = value;
-        }
+
+    // Flags sin = : mkdir -p -path=... / mkfile -r -path=...
+    static const std::regex flagRe(R"((?:^|\s)-([pPrR])(?=\s|$))");
+    for (std::sregex_iterator fit(line.begin(), line.end(), flagRe), fend; fit != fend; ++fit) {
+        std::string fk = fit->str(1);
+        std::transform(fk.begin(), fk.end(), fk.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        cmd.params[fk] = "1";
     }
-    
+
+    cmd.name = std::move(command);
     return cmd;
 }
 
-std::vector<Analyzer::Command> Analyzer::parseScript(const std::string& scriptContent) {
-    std::vector<Command> commands;
-    std::vector<std::string> lines = split(scriptContent, '\n');
-    
-    for (const auto& line : lines) {
-        std::string trimmed = trim(line);
-        if (!trimmed.empty()) {
-            commands.push_back(parseCommand(trimmed));
-        }
-    }
-    
-    return commands;
-}
-
-bool Analyzer::isComment(const std::string& line) {
-    std::string trimmed = trim(line);
-    return !trimmed.empty() && trimmed[0] == '#';
-}
+}  // namespace Analyzer

@@ -1,5 +1,8 @@
 #include "Utilities.h"
 #include <sys/stat.h>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <iostream>
@@ -25,9 +28,45 @@ bool Utilities::fileExists(const std::string& path) {
     return (stat(path.c_str(), &buffer) == 0);
 }
 
+std::string Utilities::sanitizeHostPath(std::string path) {
+    path.erase(std::remove(path.begin(), path.end(), '"'), path.end());
+    path.erase(std::remove(path.begin(), path.end(), '\''), path.end());
+    size_t first = path.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = path.find_last_not_of(" \t\r\n");
+    return path.substr(first, last - first + 1);
+}
+
 bool Utilities::createDirectories(const std::string& path) {
     std::string command = "mkdir -p \"" + path + "\"";
     return system(command.c_str()) == 0;
+}
+
+bool Utilities::createFileWithParents(const std::string& path) {
+    return CreateFile(sanitizeHostPath(path));
+}
+
+bool Utilities::CreateFile(const std::string& name) {
+    std::string pstr = sanitizeHostPath(name);
+    if (pstr.empty()) return false;
+    std::filesystem::path p(pstr);
+    std::error_code ec;
+    if (p.has_parent_path()) {
+        std::filesystem::create_directories(p.parent_path(), ec);
+        if (ec) return false;
+    }
+    std::ofstream f(pstr, std::ios::binary | std::ios::trunc);
+    return f.good();
+}
+
+std::fstream Utilities::OpenFile(const std::string& name) {
+    std::string pstr = sanitizeHostPath(name);
+    if (pstr.empty()) return std::fstream();
+    return std::fstream(pstr, std::ios::in | std::ios::out | std::ios::binary);
+}
+
+std::fstream Utilities::openBinaryReadWrite(const std::string& path) {
+    return OpenFile(path);
 }
 
 std::string Utilities::getFileName(const std::string& path) {

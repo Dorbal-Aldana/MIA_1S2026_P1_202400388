@@ -54,7 +54,14 @@ std::string SessionManager::getCurrentPartitionId() {
 }
 
 bool SessionManager::mountPartition(const std::string& path, const std::string& name, std::string& generatedId) {
-    if (isMounted(path, name)) {
+    std::string spath = Utilities::sanitizeHostPath(path);
+    std::string sname = name;
+    while (!sname.empty() && (sname.back() == '"' || sname.back() == '\'')) sname.pop_back();
+    if (spath.empty()) {
+        std::cout << "Error: Ruta de disco inválida." << std::endl;
+        return false;
+    }
+    if (isMounted(spath, sname)) {
         std::cout << "Error: La partición ya está montada." << std::endl;
         return false;
     }
@@ -65,7 +72,7 @@ bool SessionManager::mountPartition(const std::string& path, const std::string& 
         if (std::find(diskOrder.begin(), diskOrder.end(), m.path) == diskOrder.end())
             diskOrder.push_back(m.path);
     }
-    auto it = std::find(diskOrder.begin(), diskOrder.end(), path);
+    auto it = std::find(diskOrder.begin(), diskOrder.end(), spath);
     int letterIndex;
     int partitionNumber;
     if (it == diskOrder.end()) {
@@ -75,15 +82,15 @@ bool SessionManager::mountPartition(const std::string& path, const std::string& 
         letterIndex = (int)(it - diskOrder.begin());
         partitionNumber = 0;
         for (const auto& m : mountedPartitions)
-            if (m.path == path) partitionNumber++;
+            if (m.path == spath) partitionNumber++;
         partitionNumber++;
     }
     
     generatedId = Utilities::generateId(CARNET_LAST_TWO, letterIndex, partitionNumber);
     
     MountedPartition mp;
-    mp.path = path;
-    mp.name = name;
+    mp.path = spath;
+    mp.name = sname;
     mp.id = generatedId;
     mp.start = 0;
     mp.size = 0;
@@ -125,8 +132,9 @@ MountedPartition* SessionManager::findMountedPartition(const std::string& id) {
 }
 
 bool SessionManager::isMounted(const std::string& path, const std::string& name) {
+    std::string sp = Utilities::sanitizeHostPath(path);
     for (const auto& mp : mountedPartitions) {
-        if (mp.path == path && mp.name == name) {
+        if (mp.path == sp && mp.name == name) {
             return true;
         }
     }

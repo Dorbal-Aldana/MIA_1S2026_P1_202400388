@@ -1,37 +1,30 @@
-#ifndef ANALYZER_H
-#define ANALYZER_H
+#pragma once
 
-#include <string>
+#include <cctype>
 #include <map>
-#include <vector>
-#include <sstream>
+#include <string>
 
-class Analyzer {
-public:
-    struct Command {
-        std::string name;
-        std::map<std::string, std::string> params;
-        
-        bool hasParam(const std::string& key) const {
-            return params.find(key) != params.end();
-        }
-        
-        std::string getParam(const std::string& key, const std::string& defaultValue = "") const {
-            auto it = params.find(key);
-            return (it != params.end()) ? it->second : defaultValue;
-        }
-    };
-    
-    Analyzer();
-    
-    Command parseCommand(const std::string& input);
-    std::vector<Command> parseScript(const std::string& scriptContent);
-    bool isComment(const std::string& line);
-    
-private:
-    std::string toLowerCase(const std::string& str);
-    std::string trim(const std::string& str);
-    std::vector<std::string> split(const std::string& str, char delimiter);
+namespace Analyzer {
+
+/// Resultado del análisis de una línea (estilo CLASE7: comando + mapa de parámetros).
+struct ParsedCommand {
+    std::string name;
+    std::map<std::string, std::string> params;
+
+    bool hasParam(const std::string& key) const {
+        return params.find(key) != params.end();
+    }
+    /// Flag sin valor: -p, -r (calificación / lab)
+    bool hasFlag(char c) const {
+        std::string k(1, static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        auto it = params.find(k);
+        return it != params.end() && (it->second == "1" || it->second.empty());
+    }
+    std::string getParam(const std::string& key, const std::string& defaultValue = "") const;
+    bool isComment() const { return name == "comment"; }
 };
 
-#endif
+/// Parsea una línea: nombre en minúsculas y parámetros `-clave=valor` vía regex (como CLASE7).
+ParsedCommand parseLine(const std::string& input);
+
+}  // namespace Analyzer
