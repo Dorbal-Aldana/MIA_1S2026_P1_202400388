@@ -62,29 +62,44 @@ void Server::start(int port) {
             continue;
         }
         
+        // Lectura robusta: primero aseguramos que llegan TODOS los headers (\r\n\r\n),
+        // luego leemos exactamente Content-Length bytes del body.
         std::string rawRequest;
-        int totalRead = read(new_socket, buffer, 65535);
-        if (totalRead > 0) rawRequest.append(buffer, totalRead);
-        
-        size_t headerEnd = rawRequest.find("\r\n\r\n");
+        rawRequest.reserve(1024 * 64);
+        const size_t MAX_REQ_BYTES = 20 * 1024 * 1024; // 20MB
+        size_t headerEnd = std::string::npos;
+
+        // 1) Leer hasta encontrar el final de headers.
+        while (rawRequest.size() < MAX_REQ_BYTES) {
+            headerEnd = rawRequest.find("\r\n\r\n");
+            if (headerEnd != std::string::npos) break;
+            int n = read(new_socket, buffer, 65535);
+            if (n <= 0) break;
+            rawRequest.append(buffer, n);
+        }
+
+        // 2) Parsear Content-Length y leer el body completo.
         if (headerEnd != std::string::npos) {
             size_t clPos = rawRequest.find("Content-Length:");
             if (clPos != std::string::npos && clPos < headerEnd) {
-                size_t numStart = rawRequest.find_first_not_of(" \t", clPos + 14);
+                size_t numStart = rawRequest.find_first_not_of(" \t", clPos + 15);
                 size_t numEnd = rawRequest.find_first_of("\r\n", numStart);
+                int contentLen = -1;
                 if (numStart != std::string::npos && numEnd != std::string::npos) {
-                    int contentLen = 0;
-                    try { contentLen = std::stoi(rawRequest.substr(numStart, numEnd - numStart)); } catch(...) {}
-                    int bodyStart = headerEnd + 4;
-                    int haveBody = (int)rawRequest.length() - bodyStart;
-                    while (haveBody < contentLen && totalRead > 0) {
-                        int toRead = std::min(65535, contentLen - haveBody);
-                        memset(buffer, 0, 65536);
-                        totalRead = read(new_socket, buffer, toRead);
-                        if (totalRead > 0) {
-                            rawRequest.append(buffer, totalRead);
-                            haveBody += totalRead;
-                        } else break;
+                    try {
+                        contentLen = std::stoi(rawRequest.substr(numStart, numEnd - numStart));
+                    } catch (...) {
+                        contentLen = -1;
+                    }
+                }
+
+                if (contentLen >= 0) {
+                    size_t bodyStart = headerEnd + 4;
+                    size_t need = bodyStart + (size_t)contentLen;
+                    while (rawRequest.size() < need && rawRequest.size() < MAX_REQ_BYTES) {
+                        int n = read(new_socket, buffer, 65535);
+                        if (n <= 0) break;
+                        rawRequest.append(buffer, n);
                     }
                 }
             }

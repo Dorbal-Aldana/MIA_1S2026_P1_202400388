@@ -29,12 +29,42 @@ bool Utilities::fileExists(const std::string& path) {
 }
 
 std::string Utilities::sanitizeHostPath(std::string path) {
+    // Normaliza comillas tipográficas “ ” ‘ ’ a comillas ASCII para poder sanear la ruta.
+    auto replaceAll = [](std::string& s, const std::string& from, const std::string& to) {
+        if (from.empty()) return;
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.size(), to);
+            pos += to.size();
+        }
+    };
+    replaceAll(path, "\xE2\x80\x9C", "\""); // “
+    replaceAll(path, "\xE2\x80\x9D", "\""); // ”
+    replaceAll(path, "\xE2\x80\x98", "'"); // ‘
+    replaceAll(path, "\xE2\x80\x99", "'"); // ’
+
+    // Ahora eliminamos comillas ASCII sobrantes.
     path.erase(std::remove(path.begin(), path.end(), '"'), path.end());
     path.erase(std::remove(path.begin(), path.end(), '\''), path.end());
+    // En Linux, el backslash dentro del path normalmente proviene de escapes del script (ej. "file.txt\").
+    // Lo quitamos completo para evitar crear directorios con nombres raros.
+    path.erase(std::remove(path.begin(), path.end(), '\\'), path.end());
+
     size_t first = path.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return "";
     size_t last = path.find_last_not_of(" \t\r\n");
-    return path.substr(first, last - first + 1);
+    path = path.substr(first, last - first + 1);
+
+    // Si el script/PDF trae un path con "\" o "/" final (ej. ".../file.txt\"),
+    // eso rompe la deteccion de parentPath y Graphviz puede crear directorios.
+    while (!path.empty() && (path.back() == '\\' || path.back() == '/')) {
+        path.pop_back();
+    }
+    // Recortar espacios otra vez por seguridad.
+    while (!path.empty() && std::isspace(static_cast<unsigned char>(path.back()))) {
+        path.pop_back();
+    }
+    return path;
 }
 
 bool Utilities::createDirectories(const std::string& path) {

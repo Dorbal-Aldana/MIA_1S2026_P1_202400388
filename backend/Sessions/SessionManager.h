@@ -39,8 +39,8 @@ public:
     bool isMounted(const std::string& path, const std::string& name);
     bool canExecuteCommand();
     
-    // Script de calificación usa "34" como ejemplo; pon aquí tus 2 últimos dígitos (ej. 388 -> 88).
-    static const int CARNET_LAST_TWO = 34;
+    // Script de calificación (tu caso) usa "88" en IDs (881A, 881B, etc.).
+    static const int CARNET_LAST_TWO = 88;
 };
 
 #endif

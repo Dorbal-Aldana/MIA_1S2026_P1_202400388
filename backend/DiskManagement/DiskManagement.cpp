@@ -2,6 +2,7 @@
 #include "DiskManagementImpl.h"
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <ostream>
@@ -10,6 +11,66 @@
 #include <algorithm>
 #include <climits>
 #include <functional>
+#include <vector>
+#include <cstdlib>
+#include <queue>
+#include <set>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#include <sys/wait.h>
+#endif
+
+namespace {
+
+#if defined(__unix__) || defined(__APPLE__)
+/** Ejecuta dot sin pasar por /bin/sh (PATH del proceso servidor a veces no incluye /usr/bin). */
+static bool posixRunDot(const std::string& dotBinary, const std::string& typeShort,
+                        const std::string& inputPath, const std::string& outputPath) {
+    const std::string tflag = "-T" + typeShort;
+    pid_t pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        const char* path = dotBinary.c_str();
+        const char* argv0 = "dot";
+        if (dotBinary.find('/') != std::string::npos)
+            execl(path, argv0, tflag.c_str(), inputPath.c_str(), "-o", outputPath.c_str(),
+                  static_cast<char*>(nullptr));
+        else
+            execlp(path, argv0, tflag.c_str(), inputPath.c_str(), "-o", outputPath.c_str(),
+                   static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        return false;
+    if (!WIFEXITED(status))
+        return false;
+    return WEXITSTATUS(status) == 0;
+}
+
+static bool tryGraphvizRender(const std::string& dotInputPath, const std::string& imageOutPath,
+                              const std::vector<std::string>& formatTypes,
+                              const std::vector<std::string>& dotBinaries) {
+    namespace fs = std::filesystem;
+    for (const std::string& bin : dotBinaries) {
+        for (const std::string& t : formatTypes) {
+            if (!posixRunDot(bin, t, dotInputPath, imageOutPath))
+                continue;
+            std::error_code ec;
+            if (fs::exists(imageOutPath, ec) && fs::is_regular_file(imageOutPath, ec)) {
+                auto sz = fs::file_size(imageOutPath, ec);
+                if (!ec && sz > 0)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
+} // namespace
 
 namespace detail {
 
@@ -1084,6 +1145,16 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
     std::cout << "Generando reporte " << name << "..." << std::endl;
     std::string outPath = Utilities::sanitizeHostPath(outputPath);
     if (outPath.empty()) return false;
+
+    // Si por ejecuciones anteriores se creó un directorio con el mismo nombre que el archivo,
+    // Graphviz no podrá sobrescribirlo. Intentamos eliminarlo (solo si es directorio).
+    try {
+        namespace fs = std::filesystem;
+        if (fs::exists(outPath) && fs::is_directory(outPath)) {
+            fs::remove(outPath);
+        }
+    } catch (...) {}
+
     std::string parentPath = Utilities::getParentPath(outPath);
     if (!parentPath.empty() && !Utilities::fileExists(parentPath)) Utilities::createDirectories(parentPath);
     auto toLower = [](std::string s) {
@@ -1103,17 +1174,121 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         if (ext == "jpg" || ext == "jpeg") return "jpg";
         return "jpg";
     };
-    auto runDot = [&](const std::string& dotPath) {
-        std::string t = graphvizTypeFor(outPath);
-        std::string cmd = "dot -T" + t + " \"" + dotPath + "\" -o \"" + outPath + "\" 2>/dev/null || true";
-        system(cmd.c_str());
+    auto runDot = [&](const std::string& dotInputPath) {
+        namespace fs = std::filesystem;
+        auto shellSingleQuote = [](const std::string& s) -> std::string {
+            std::string r = "'";
+            for (char c : s) {
+                if (c == '\'')
+                    r += "'\\''";
+                else
+                    r += c;
+            }
+            return r + "'";
+        };
+        std::string want = graphvizTypeFor(outPath);
+        std::vector<std::string> types;
+        if (want == "pdf")
+            types = {"pdf"};
+        else if (want == "png")
+            types = {"png", "png:cairo"};
+        else
+            types = {"jpeg", "jpg"};
+        // Rutas absolutas primero: al arrancar desde IDE/GUI el PATH suele no traer /usr/bin.
+        const std::vector<std::string> dotBins = {
+            "/usr/bin/dot", "/usr/local/bin/dot", "/bin/dot", "dot"
+        };
+        bool ok = false;
+#if defined(__unix__) || defined(__APPLE__)
+        ok = tryGraphvizRender(dotInputPath, outPath, types, dotBins);
+        // Sin plugin GD, `dot -Tjpeg` falla pero `-Tpng` (cairo) suele funcionar.
+        if (!ok && want != "pdf" && want != "png") {
+            size_t lastDot = outPath.find_last_of('.');
+            size_t lastSep = outPath.find_last_of("/\\");
+            std::string pngTmp;
+            if (lastDot != std::string::npos && (lastSep == std::string::npos || lastDot > lastSep))
+                pngTmp = outPath.substr(0, lastDot) + ".tmp_rep.png";
+            else
+                pngTmp = outPath + ".tmp_rep.png";
+            std::error_code ecRm;
+            fs::remove(pngTmp, ecRm);
+            if (tryGraphvizRender(dotInputPath, pngTmp, {"png", "png:cairo", "png"}, dotBins)) {
+                auto shellOk = [](int st) {
+                    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+                };
+                const std::string qP = shellSingleQuote(pngTmp);
+                const std::string qO = shellSingleQuote(outPath);
+                const std::vector<std::string> convertCmds = {
+                    std::string("magick ") + qP + " " + qO,
+                    std::string("convert ") + qP + " " + qO,
+                    std::string("ffmpeg -y -nostdin -i ") + qP + " -frames:v 1 " + qO + " 2>/dev/null"
+                };
+                for (const std::string& c : convertCmds) {
+                    if (!shellOk(std::system(c.c_str())))
+                        continue;
+                    std::error_code ec;
+                    if (fs::exists(outPath, ec) && fs::is_regular_file(outPath, ec)) {
+                        auto sz = fs::file_size(outPath, ec);
+                        if (!ec && sz > 0) {
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            fs::remove(pngTmp, ecRm);
+        }
+#else
+        const std::string qIn = shellSingleQuote(dotInputPath);
+        const std::string qOut = shellSingleQuote(outPath);
+        for (const std::string& bin : dotBins) {
+            for (const std::string& t : types) {
+                std::string cmd = bin + " -T" + t + " " + qIn + " -o " + qOut;
+                int st = std::system(cmd.c_str());
+                if (st != 0)
+                    continue;
+                std::error_code ec;
+                if (fs::exists(outPath, ec) && fs::is_regular_file(outPath, ec)) {
+                    auto sz = fs::file_size(outPath, ec);
+                    if (!ec && sz > 0) {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            if (ok) break;
+        }
+#endif
+        if (!ok) {
+            std::cout << "Advertencia: Graphviz no generó la imagen en \"" << outPath << "\".\n"
+                      << "  Pruebe en terminal: /usr/bin/dot -Tjpeg -V   y   /usr/bin/dot -Tpng -V\n"
+                      << "  Fedora (JPEG directo): sudo dnf install graphviz graphviz-gd\n"
+                      << "  O bien: sudo dnf install ffmpeg (o ImageMagick) para convertir PNG→JPG."
+                      << std::endl;
+        }
     };
+    // Salida Graphviz: `p4_r1_inode.dot` + `p4_r1_inode.jpg` (no `p4_r1_inode.jpg.dot`).
+    auto sidecarDotPath = [](const std::string& out) -> std::string {
+        size_t lastDot = out.find_last_of('.');
+        size_t lastSep = out.find_last_of("/\\");
+        if (lastDot != std::string::npos && (lastSep == std::string::npos || lastDot > lastSep))
+            return out.substr(0, lastDot) + ".dot";
+        return out + ".dot";
+    };
+    const std::string dotFilePath = sidecarDotPath(outPath);
+    try {
+        namespace fs = std::filesystem;
+        // Limpia nombre antiguo incorrecto (*.jpg.dot) si quedó de versiones previas.
+        std::string legacy = outPath + ".dot";
+        if (legacy != dotFilePath && fs::exists(legacy)) fs::remove(legacy);
+    } catch (...) {}
+
     if (rname == "mbr") {
         if (!openDisk(diskPath, std::ios::in | std::ios::binary)) return false;
         MBR mbr;
         if (!readStructure(0, mbr)) { closeDisk(); return false; }
         closeDisk();
-        std::ofstream dotFile(outPath + ".dot");
+        std::ofstream dotFile(dotFilePath);
         dotFile << "digraph MBR { node [shape=plaintext]; mbr [label=<\n<table border='1'>\n";
         dotFile << "<tr><td colspan='2'>MBR</td></tr>\n<tr><td>mbr_tamano</td><td>" << mbr.mbr_tamano << "</td></tr>\n";
         dotFile << "<tr><td>mbr_fecha_creacion</td><td>" << Utilities::timeToString(mbr.mbr_fecha_creacion) << "</td></tr>\n";
@@ -1126,7 +1301,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         }
         dotFile << "</table>>]; }" << std::endl;
         dotFile.close();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     if (rname == "disk") {
@@ -1134,7 +1309,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         MBR mbr;
         if (!readStructure(0, mbr)) { closeDisk(); return false; }
         closeDisk();
-        std::ofstream dotFile(outPath + ".dot");
+        std::ofstream dotFile(dotFilePath);
         dotFile << "digraph DISK {\n  rankdir=LR;\n  node [shape=box];\n";
         dotFile << "  mbr [label=\"MBR\\n" << sizeof(MBR) << " B\"];\n";
         for (int i = 0; i < 4; i++) {
@@ -1145,7 +1320,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         }
         dotFile << "  info [shape=note,label=\"Tamaño disco: " << mbr.mbr_tamano << " bytes\"];\n}\n";
         dotFile.close();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     if (rname == "sb") {
@@ -1153,14 +1328,14 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         Superblock sb;
         if (!readStructure(partStart, sb)) { closeDisk(); return false; }
         closeDisk();
-        std::ofstream dotFile(outPath + ".dot");
+        std::ofstream dotFile(dotFilePath);
         dotFile << "digraph SB { node [shape=plaintext]; sb [label=<\n<table border='1'>\n";
         dotFile << "<tr><td>s_filesystem_type</td><td>" << sb.s_filesystem_type << "</td></tr>\n";
         dotFile << "<tr><td>s_inodes_count</td><td>" << sb.s_inodes_count << "</td></tr>\n";
         dotFile << "<tr><td>s_blocks_count</td><td>" << sb.s_blocks_count << "</td></tr>\n";
         dotFile << "<tr><td>s_magic</td><td>0x" << std::hex << sb.s_magic << std::dec << "</td></tr>\n</table>>]; }" << std::endl;
         dotFile.close();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     if (rname == "bm_inode" || rname == "bm_block") {
@@ -1196,7 +1371,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         if (!readStructure(partStart, sb)) { closeDisk(); return false; }
         int n = sb.s_inodes_count, inodeSize = (int)sizeof(Inode);
         int inode_start = sb.s_inode_start;
-        std::ofstream dotFile(outPath + ".dot");
+        std::ofstream dotFile(dotFilePath);
         dotFile << "digraph INODES { node [shape=plaintext]; tbl [label=<<table border='1'><tr><td>i</td><td>tipo</td><td>size</td><td>b0</td></tr>\n";
         for (int i = 0; i < n; i++) {
             Inode ino;
@@ -1207,7 +1382,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         dotFile << "</table>>]; }\n";
         dotFile.close();
         closeDisk();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     if (rname == "block") {
@@ -1216,7 +1391,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         if (!readStructure(partStart, sb)) { closeDisk(); return false; }
         int nBlocks = sb.s_blocks_count, blockSize = sb.s_block_size;
         int block_start = sb.s_block_start;
-        std::ofstream dotFile(outPath + ".dot");
+        std::ofstream dotFile(dotFilePath);
         dotFile << "digraph BLOCKS { node [shape=plaintext]; tbl [label=<<table border='1'><tr><td>blk</td><td>hex (primeros 8)</td></tr>\n";
         int maxShow = std::min(nBlocks, 64);
         for (int b = 0; b < maxShow; b++) {
@@ -1229,7 +1404,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         dotFile << "</table>>]; }\n";
         dotFile.close();
         closeDisk();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     if (rname == "file" || rname == "ls") {
@@ -1255,7 +1430,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
             std::string data;
             Ext2Ops::readFileContent(*this, inode_start, inodeSize, block_start, blockSize, ino, data);
             if (data.size() > 500) data = data.substr(0, 500) + "...";
-            std::ofstream dotFile(outPath + ".dot");
+            std::ofstream dotFile(dotFilePath);
             dotFile << "digraph FILE { f [label=\"";
             for (char c : data) {
                 if (c == '"' || c == '\\' || c == '\n') dotFile << ' ';
@@ -1264,7 +1439,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
             dotFile << "\"]; }\n";
             dotFile.close();
             closeDisk();
-            runDot(outPath + ".dot");
+            runDot(dotFilePath);
             return true;
         }
         auto parts = Ext2Ops::splitVirt(vpath);
@@ -1287,7 +1462,7 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
             closeDisk();
             return false;
         }
-        std::ofstream dotFile(outPath + ".dot");
+        std::ofstream dotFile(dotFilePath);
         dotFile << "digraph LS { node [shape=plaintext]; t [label=<<table border='1'><tr><td>nombre</td><td>inodo</td></tr>\n";
         for (int bi = 0; bi < 12; bi++) {
             if (dirIno.i_block[bi] < 0) break;
@@ -1302,43 +1477,163 @@ bool DiskManagementImpl::rep(const std::string& name, const std::string& outputP
         dotFile << "</table>>]; }\n";
         dotFile.close();
         closeDisk();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     if (rname == "tree") {
         if (!openDisk(diskPath, std::ios::in | std::ios::binary)) return false;
         Superblock sb;
         if (!readStructure(partStart, sb)) { closeDisk(); return false; }
-        int inodeSize = (int)sizeof(Inode), blockSize = sb.s_block_size;
-        int inode_start = sb.s_inode_start, block_start = sb.s_block_start;
-        std::function<void(std::ostream&, int, const std::string&)> dump;
-        dump = [&](std::ostream& o, int inoIdx, const std::string& indent) {
+        const int inodeSize = (int)sizeof(Inode);
+        const int blockSize = sb.s_block_size;
+        const int inode_start = sb.s_inode_start;
+        const int block_start = sb.s_block_start;
+        const int nInodes = sb.s_inodes_count;
+
+        auto trimName = [](const char* raw, size_t cap) -> std::string {
+            std::string s(raw, strnlen(raw, cap));
+            while (!s.empty() && s.back() == ' ') s.pop_back();
+            return s;
+        };
+        auto escapeHtml = [](std::string s) -> std::string {
+            std::string r;
+            r.reserve(s.size() + 8);
+            for (unsigned char c : s) {
+                if (c == '&')
+                    r += "&amp;";
+                else if (c == '<')
+                    r += "&lt;";
+                else if (c == '>')
+                    r += "&gt;";
+                else if (c == '"')
+                    r += "&quot;";
+                else if (c == '\r' || c == '\n')
+                    r += ' ';
+                else
+                    r += (char)c;
+            }
+            return r;
+        };
+        auto filePreview = [&](const BlockFile& bf) -> std::string {
+            size_t n = strnlen(bf.b_content, sizeof(bf.b_content));
+            std::string s(bf.b_content, n);
+            if (s.size() > 180)
+                s = s.substr(0, 177) + "...";
+            return escapeHtml(s);
+        };
+
+        std::set<int> emittedInodo;
+        std::set<int> emittedBcarpeta;
+        std::set<int> emittedBarchivo;
+        std::ostringstream edges;
+
+        auto emitInodoNode = [&](std::ostream& out, int idx, const Inode& ino) {
+            out << "  inodo_" << idx << " [shape=none, margin=0, label=<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"4\">\n";
+            out << "    <TR><TD COLSPAN=\"2\" BGCOLOR=\"#1a4373\" ALIGN=\"CENTER\"><FONT COLOR=\"white\"><B>Inodo "
+                << idx << "</B></FONT></TD></TR>\n";
+            for (int k = 0; k < 15; k++) {
+                out << "    <TR><TD ALIGN=\"LEFT\">i_block_" << k << "</TD><TD";
+                if (ino.i_block[k] >= 0)
+                    out << " PORT=\"ib" << k << "\"";
+                out << " ALIGN=\"CENTER\">" << ino.i_block[k] << "</TD></TR>\n";
+            }
+            out << "  </TABLE>>];\n";
+        };
+
+        auto emitBloqueCarpeta = [&](std::ostream& out, int blk, const BlockFolder& bf) {
+            out << "  bc_" << blk << " [shape=none, margin=0, label=<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"4\">\n";
+            out << "    <TR><TD COLSPAN=\"2\" BGCOLOR=\"#87CEEB\" ALIGN=\"CENTER\"><B>Bloque Carpeta " << blk
+                << "</B></TD></TR>\n";
+            out << "    <TR><TD BGCOLOR=\"#e0e0e0\"><B>nombre</B></TD><TD BGCOLOR=\"#e0e0e0\"><B>inodo</B></TD></TR>\n";
+            for (int j = 0; j < 4; j++) {
+                std::string nm = trimName(bf.b_content[j].b_name, sizeof(bf.b_content[j].b_name));
+                if (nm.empty())
+                    nm = "(vacío)";
+                out << "    <TR><TD ALIGN=\"LEFT\">" << escapeHtml(nm) << "</TD><TD ALIGN=\"CENTER\"";
+                if (bf.b_content[j].b_inodo >= 0)
+                    out << " PORT=\"e" << j << "\"";
+                out << ">" << bf.b_content[j].b_inodo << "</TD></TR>\n";
+            }
+            out << "  </TABLE>>];\n";
+        };
+
+        auto emitBloqueArchivo = [&](std::ostream& out, int blk, const BlockFile& bf) {
+            out << "  ba_" << blk << " [shape=none, margin=0, label=<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"4\">\n";
+            out << "    <TR><TD BGCOLOR=\"#2e8b57\" ALIGN=\"CENTER\"><FONT COLOR=\"white\"><B>Bloque Archivo " << blk
+                << "</B></FONT></TD></TR>\n";
+            out << "    <TR><TD ALIGN=\"LEFT\">" << filePreview(bf) << "</TD></TR>\n";
+            out << "  </TABLE>>];\n";
+        };
+
+        std::queue<int> q;
+        std::set<int> visitInodo;
+        q.push(0);
+        visitInodo.insert(0);
+
+        std::ofstream dotFile(dotFilePath);
+        dotFile << "digraph TREE {\n";
+        dotFile << "  graph [rankdir=LR, bgcolor=white];\n";
+        dotFile << "  node [fontname=\"Helvetica\", fontsize=10];\n";
+        dotFile << "  edge [arrowhead=vee, fontsize=9];\n";
+
+        while (!q.empty()) {
+            const int i = q.front();
+            q.pop();
+            if (i < 0 || i >= nInodes)
+                continue;
             Inode ino;
-            if (!readStructure(inode_start + inoIdx * inodeSize, ino)) return;
+            if (!readStructure(inode_start + i * inodeSize, ino))
+                continue;
+            if (!emittedInodo.count(i)) {
+                emittedInodo.insert(i);
+                emitInodoNode(dotFile, i, ino);
+            }
             if (ino.i_type == '0') {
-                for (int bi = 0; bi < 12; bi++) {
-                    if (ino.i_block[bi] < 0) break;
+                for (int k = 0; k < 15; k++) {
+                    const int blk = ino.i_block[k];
+                    if (blk < 0)
+                        continue;
                     BlockFolder bf;
-                    if (!readStructure(block_start + ino.i_block[bi] * blockSize, bf)) break;
+                    if (!readStructure(block_start + blk * blockSize, bf))
+                        continue;
+                    if (!emittedBcarpeta.count(blk)) {
+                        emittedBcarpeta.insert(blk);
+                        emitBloqueCarpeta(dotFile, blk, bf);
+                    }
+                    edges << "  inodo_" << i << ":ib" << k << " -> bc_" << blk << ";\n";
                     for (int j = 0; j < 4; j++) {
-                        if (bf.b_content[j].b_inodo < 0) continue;
-                        std::string nm = bf.b_content[j].b_name;
-                        if (nm == "." || nm == "..") continue;
-                        o << indent << nm << "\\n";
-                        dump(o, bf.b_content[j].b_inodo, indent + "  ");
+                        const int ch = bf.b_content[j].b_inodo;
+                        if (ch < 0)
+                            continue;
+                        edges << "  bc_" << blk << ":e" << j << " -> inodo_" << ch << ";\n";
+                        if (!visitInodo.count(ch) && ch < nInodes) {
+                            visitInodo.insert(ch);
+                            q.push(ch);
+                        }
                     }
                 }
+            } else if (ino.i_type == '1') {
+                for (int k = 0; k < 15; k++) {
+                    const int blk = ino.i_block[k];
+                    if (blk < 0)
+                        continue;
+                    BlockFile bfile;
+                    if (!readStructure(block_start + blk * blockSize, bfile))
+                        continue;
+                    if (!emittedBarchivo.count(blk)) {
+                        emittedBarchivo.insert(blk);
+                        emitBloqueArchivo(dotFile, blk, bfile);
+                    }
+                    edges << "  inodo_" << i << ":ib" << k << " -> ba_" << blk << ";\n";
+                }
             }
-        };
-        std::ofstream dotFile(outPath + ".dot");
-        dotFile << "digraph TREE { root [shape=box,label=\"";
-        std::ostringstream tr;
-        dump(tr, 0, "");
-        dotFile << tr.str();
-        dotFile << "\"]; }\n";
+        }
+
+        dotFile << edges.str();
+        dotFile << "}\n";
         dotFile.close();
         closeDisk();
-        runDot(outPath + ".dot");
+        runDot(dotFilePath);
         return true;
     }
     std::cout << "Error: tipo de reporte no soportado: " << name << std::endl;

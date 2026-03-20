@@ -65,7 +65,8 @@ ParsedCommand parseLine(const std::string& input) {
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     // Misma idea que CLASE7: -param="valor" o -param=valor
-    static const std::regex re(R"(-(\w+)=("[^"]+"|\S+))");
+    // (El '-' del PDF a veces llega como guion Unicode.)
+    static const std::regex re(R"((?:^|\s)[-\u2010-\u2015\u2212](\w+)=("[^"]+"|\S+))");
     std::sregex_iterator it(line.begin(), line.end(), re);
     std::sregex_iterator end;
 
@@ -80,7 +81,7 @@ ParsedCommand parseLine(const std::string& input) {
     }
 
     // Flags sin = : mkdir -p -path=... / mkfile -r -path=...
-    static const std::regex flagRe(R"((?:^|\s)-([pPrR])(?=\s|$))");
+    static const std::regex flagRe(R"((?:^|\s)[-\u2010-\u2015\u2212]([pPrR])(?=\s|$))");
     for (std::sregex_iterator fit(line.begin(), line.end(), flagRe), fend; fit != fend; ++fit) {
         std::string fk = fit->str(1);
         std::transform(fk.begin(), fk.end(), fk.begin(),
